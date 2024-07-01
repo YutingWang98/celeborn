@@ -20,8 +20,10 @@ package org.apache.celeborn.client
 import java.util
 import java.util.{Set => JSet}
 import java.util.concurrent.{ConcurrentHashMap, ScheduledExecutorService, ScheduledFuture, TimeUnit}
+import java.util.concurrent.locks.ReentrantLock
 
 import scala.collection.JavaConverters._
+import scala.concurrent.duration.DurationInt
 
 import org.apache.celeborn.common.CelebornConf
 import org.apache.celeborn.common.internal.Logging
@@ -47,8 +49,11 @@ class ChangePartitionManager(
   // shuffleId -> (partitionId -> set of ChangePartition)
   private val changePartitionRequests =
     JavaUtils.newConcurrentHashMap[Int, ConcurrentHashMap[Integer, JSet[ChangePartitionRequest]]]()
+  private val locks = Array.fill(conf.batchHandleChangePartitionParallelism)(new AnyRef())
+
   // shuffleId -> set of partition id
-  private val inBatchPartitions = JavaUtils.newConcurrentHashMap[Int, JSet[Integer]]()
+  private val inBatchPartitions =
+    JavaUtils.newConcurrentHashMap[Int, ConcurrentHashMap.KeySetView[Int, java.lang.Boolean]]()
 
   private val batchHandleChangePartitionEnabled = conf.batchHandleChangePartitionEnabled
   private val batchHandleChangePartitionExecutors = ThreadUtils.newDaemonCachedThreadPool(
@@ -79,14 +84,19 @@ class ChangePartitionManager(
                 batchHandleChangePartitionExecutors.submit {
                   new Runnable {
                     override def run(): Unit = {
-                      val distinctPartitions = requests.synchronized {
+                      val distinctPartitions = {
+                        val requestSet = inBatchPartitions.get(shuffleId)
                         // For each partition only need handle one request
-                        requests.asScala.filter { case (partitionId, _) =>
-                          !inBatchPartitions.get(shuffleId).contains(partitionId)
-                        }.map { case (partitionId, request) =>
-                          inBatchPartitions.get(shuffleId).add(partitionId)
-                          request.asScala.toArray.maxBy(_.epoch)
-                        }.toArray
+                        requests.asScala.map { case (partitionId, request) =>
+                          locks(partitionId % locks.length).synchronized {
+                            if (!requestSet.contains(partitionId)) {
+                              requestSet.add(partitionId)
+                              Some(request.asScala.toArray.maxBy(_.epoch))
+                            } else {
+                              None
+                            }
+                          }
+                        }.filter(_.isDefined).map(_.get).toArray
                       }
                       if (distinctPartitions.nonEmpty) {
                         handleRequestPartitions(
@@ -112,7 +122,7 @@ class ChangePartitionManager(
 
   def stop(): Unit = {
     batchHandleChangePartition.foreach(_.cancel(true))
-    batchHandleChangePartitionSchedulerThread.foreach(ThreadUtils.shutdown(_))
+    batchHandleChangePartitionSchedulerThread.foreach(ThreadUtils.shutdown(_, 800.millis))
   }
 
   private val rpcContextRegisterFunc =
@@ -123,9 +133,11 @@ class ChangePartitionManager(
         JavaUtils.newConcurrentHashMap()
     }
 
-  private val inBatchShuffleIdRegisterFunc = new util.function.Function[Int, util.Set[Integer]]() {
-    override def apply(s: Int): util.Set[Integer] = new util.HashSet[Integer]()
-  }
+  private val inBatchShuffleIdRegisterFunc =
+    new util.function.Function[Int, ConcurrentHashMap.KeySetView[Int, java.lang.Boolean]]() {
+      override def apply(s: Int): ConcurrentHashMap.KeySetView[Int, java.lang.Boolean] =
+        ConcurrentHashMap.newKeySet[Int]()
+    }
 
   def handleRequestPartitionLocation(
       context: RequestLocationCallContext,
@@ -151,7 +163,7 @@ class ChangePartitionManager(
       oldPartition,
       cause)
 
-    requests.synchronized {
+    locks(partitionId % locks.length).synchronized {
       if (requests.containsKey(partitionId)) {
         requests.get(partitionId).add(changePartition)
         logTrace(s"[handleRequestPartitionLocation] For $shuffleId, request for same partition" +
